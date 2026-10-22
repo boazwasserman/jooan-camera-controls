@@ -1,0 +1,33 @@
+nudge:
+  name: Nudge camera
+  description: Move a configured JOOAN camera briefly in one direction.
+  fields:
+    entity_id:
+      name: Camera
+      description: One configured camera entity.
+      required: true
+      selector:
+        entity:
+          domain: camera
+    direction:
+      name: Direction
+      description: Direction of the bounded movement.
+      required: true
+      selector:
+        select:
+          options:
+            - left
+            - right
+            - up
+            - down
+stop:
+  name: Stop camera
+  description: Stop a configured JOOAN camera.
+  fields:
+    entity_id:
+      name: Camera
+      description: One configured camera entity.
+      required: true
+      selector:
+        entity:
+          domain: camera
