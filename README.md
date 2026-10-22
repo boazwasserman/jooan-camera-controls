@@ -119,9 +119,11 @@ automation that overwrites a persisted choice.
 PTZ requires an explicit target, profile, ONVIF path, and port 8899
 qualification; this is not a universal model-compatibility claim. The only
 directions are `left`, `right`, `up`, and `down`; this backend does not expose
-zoom. Cancellation, unload, and Stop failures are handled fail-closed; a
+zoom. Cancellation, shutdown, and Stop failures are handled fail-closed; a
 failed Stop latches the camera until a successful Stop. No startup PTZ command
-is issued.
+is issued. This YAML-only integration does not support unloading or reloading;
+configuration changes require a Home Assistant restart. Its shutdown handler
+blocks new operations and attempts Stop before Home Assistant exits.
 
 Example service calls:
 
