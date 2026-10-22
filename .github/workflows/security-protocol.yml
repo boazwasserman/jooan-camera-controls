@@ -1,0 +1,28 @@
+name: Security protocol
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  security-protocol:
+    if: github.event.pull_request.merged != true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted base branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.14"
+      - name: Validate security report against PR head
+        run: python tools/check_security_pr.py --event "$GITHUB_EVENT_PATH"
+      - name: Test protocol guards
+        run: python -m unittest discover -s tests -p 'test_security_contribution_protocol.py'
