@@ -23,6 +23,8 @@ jobs:
         with:
           python-version: "3.14"
       - name: Validate security report against PR head
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python tools/check_security_pr.py --event "$GITHUB_EVENT_PATH"
       - name: Test protocol guards
         run: python -m unittest discover -s tests -p 'test_security_contribution_protocol.py'
