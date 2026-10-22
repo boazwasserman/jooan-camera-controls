@@ -20,6 +20,12 @@ or copy `custom_components/jooan_night_vision` into the
 This is an unofficial community package and is not affiliated with or endorsed
 by JOOAN. No configuration flow is included in this initial YAML-based release.
 
+The manifest uses Home Assistant's required minimum-version declarations for
+`defusedxml` and `paho-mqtt`; Hassfest rejects exact pins for these shared
+packages. Home Assistant manages dependency resolution and updates, so the
+manifest is not a standalone dependency lockfile. Validate Home Assistant and
+dependency upgrades before relying on camera control.
+
 ## Cloud mode configuration
 
 Add a select platform entry to `configuration.yaml`. Keep credentials in
