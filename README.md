@@ -13,9 +13,11 @@ Home Assistant.
 
 ## Installation
 
-Install the repository with HACS as a custom repository of type **Integration**,
-or copy `custom_components/jooan_night_vision` into the
-`custom_components` directory. Restart Home Assistant after installation.
+In HACS, search for **JOOAN Camera Controls** and select **Download**. Restart
+Home Assistant after installation.
+
+As a manual alternative, copy `custom_components/jooan_night_vision` into the
+`custom_components` directory, then restart Home Assistant.
 
 This is an unofficial community package and is not affiliated with or endorsed
 by JOOAN. No configuration flow is included in this initial YAML-based release.
