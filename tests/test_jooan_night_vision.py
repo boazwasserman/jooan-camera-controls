@@ -1101,3 +1101,27 @@ async def test_time_zone_failure_does_not_clear_night_vision_state(monkeypatch):
         await zone.async_select_option("Asia/Jerusalem")
     assert "secret" not in str(error.value)
     assert night.current_option == OPTIONS[1]
+
+
+@pytest.mark.asyncio
+async def test_time_zone_restore_ignores_states_outside_the_allow_list(monkeypatch):
+    monkeypatch.setattr(
+        "custom_components.jooan_night_vision.select.cloud_offset",
+        lambda z: "GMT+02:00",
+    )
+    for stored, expected in (
+        ("Asia/Jerusalem", "Asia/Jerusalem"),
+        ("Mars/Base", None),
+        ("<script>alert(1)</script>", None),
+        ("unknown", None),
+    ):
+        night, zone = _tz_pair(_ReadHass(client.JooanState(1, 20, 6, "GMT+02:00", None)))
+        night._cloud = client.JooanState(1, 20, 6, "GMT+02:00", None)
+
+        async def last_state(stored=stored):
+            return SimpleNamespace(state=stored)
+
+        zone.async_get_last_state = last_state
+        await zone.async_added_to_hass()
+        assert zone.current_option == expected
+        assert zone._remembered in (None, "Asia/Jerusalem")
