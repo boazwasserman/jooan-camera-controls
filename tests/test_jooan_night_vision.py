@@ -901,12 +901,19 @@ async def test_read_failure_keeps_last_state_and_reports_error():
 
 
 @pytest.mark.asyncio
-async def test_refresh_is_skipped_while_a_command_holds_the_lock():
+async def test_refresh_waits_for_the_account_lock_instead_of_skipping():
     hass = _ReadHass(client.JooanState(1, 20, 6))
     entity = _entity(hass)
-    async with entity._lock:
-        await entity.async_refresh()
-    assert hass.calls == []
+    sibling = _entity(hass)
+    sibling._lock = entity._lock  # two cameras of one account share the lock
+    await entity._lock.acquire()
+    tasks = [asyncio.create_task(entity.async_refresh()), asyncio.create_task(sibling.async_refresh())]
+    await asyncio.sleep(0)
+    assert hass.calls == [] and not any(t.done() for t in tasks)
+    entity._lock.release()
+    await asyncio.gather(*tasks)
+    assert [c[0] for c in hass.calls] == ["read_state", "read_state"]
+    assert entity.current_option == OPTIONS[1] and sibling.current_option == OPTIONS[1]
 
 
 def test_set_schedule_service_schema_accepts_only_whole_hours():
