@@ -223,9 +223,12 @@ class JooanNightVisionSelect(SelectEntity):
         await self.async_refresh()
 
     async def async_refresh(self) -> None:
-        """Read the cloud state; skipped while a command holds the account lock."""
-        if self._lock.locked():
-            return
+        """Read the cloud state, waiting for the shared account lock.
+
+        Both cameras of one account share the lock; waiting (rather than
+        skipping) keeps every camera's startup and periodic read from being
+        starved by a sibling's read or a command.
+        """
         async with self._lock:
             await self._async_read()
         self._publish()
