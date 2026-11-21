@@ -60,8 +60,11 @@ jooan_camera_ptz_profile: "synthetic-profile-token"
 ```
 
 The supported options are exactly **Normal night vision**, **Scheduled full
-color**, and **Smart full color**. Scheduled full color is a device schedule
-mode; it is not a promise of always-on full color.
+color**, **Smart full color** and **Off** (night mode closed; mode `3`, taken
+from the vendor app and confirmed on a live camera that lists
+`support_turn_off_night_mode`). Scheduled full color is a device schedule
+mode; it is not a promise of always-on full color. Off removes night vision, so
+use it deliberately.
 
 The integration verifies that the configured device is uniquely owned before
 publishing a command, waits for the device acknowledgement, then reads the
@@ -76,7 +79,18 @@ package.
 
 The `jooan_night_vision.set_schedule` action (`entity_id`, whole-hour `start`
 and `end`) writes the camera's own daily Scheduled-full-color window and
-confirms it the same way. See [`docs/night-vision-protocol.md`](docs/night-vision-protocol.md).
+confirms it the same way.
+
+Each camera also gets a **time zone** select (`select.<camera>_time_zone`, the
+configured name without its "Night Vision" suffix) listing IANA zones. Selecting
+one sends the vendor app's time-zone command with the zone's current
+`GMT+hh:mm` offset, which also corrects the camera's on-screen clock, then
+confirms it from the cloud `timezone` property. The camera stores only the GMT
+offset, so Home Assistant remembers the IANA name and shows it while the offset
+still matches. The offset is fixed when you select it: after a daylight-saving
+change, select the zone again. The vendor app has no separate "sync clock"
+command that this camera acknowledged, so none is offered. See
+[`docs/night-vision-protocol.md`](docs/night-vision-protocol.md).
 
 ## Optional local PTZ
 

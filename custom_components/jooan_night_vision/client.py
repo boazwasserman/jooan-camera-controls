@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import secrets
 import ssl
 import threading
@@ -14,10 +15,14 @@ from urllib.parse import urlsplit
 import paho.mqtt.client as mqtt
 import requests
 
+from .timezones import TIME_ZONES, cloud_offset
+
 BASE_URL = "https://use1api.jooaniot.com"
 PACKAGE_NAME = "CAM720.vmsToolsApp"
 COMMAND = 66435
 SCHEDULE_COMMAND = 66452
+TIMEZONE_COMMAND = 66357
+MODES = (0, 1, 2, 3)  # 3 is "Off" (night mode closed), per the vendor app
 SCHEDULE_KEY = "newflood_light_schedule"
 _HOST_SUFFIXES = (".jooaniot.com", ".qalink.cn")
 _EXACT_HOST = "huiyancommserver.lenovo.com.cn"
@@ -132,7 +137,7 @@ class JooanClient:
         self.device_id = validate_uid(device_id)
 
     def set_mode(self, mode: int) -> None:
-        if not _actual_int(mode) or mode not in (0, 1, 2):
+        if not _actual_int(mode) or mode not in MODES:
             raise JooanClientError("The night-vision mode is invalid")
         self._run(
             {"cmd_type": "request", "cmd": COMMAND, "value": mode},
@@ -153,6 +158,25 @@ class JooanClient:
             SCHEDULE_COMMAND,
             None,
             "The JOOAN schedule command failed",
+        )
+
+    def set_time_zone(self, zone: str) -> None:
+        """Set the camera time zone as the vendor app does (``GMT+hh:mm``)."""
+        if zone not in TIME_ZONES:
+            raise JooanClientError("The time zone is not supported")
+        try:
+            offset = cloud_offset(zone)
+        except ValueError:
+            raise JooanClientError("The time zone is not supported") from None
+        self._run(
+            {
+                "cmd_type": "request",
+                "cmd": TIMEZONE_COMMAND,
+                "value": offset,
+            },
+            TIMEZONE_COMMAND,
+            None,
+            "The JOOAN time-zone command failed",
         )
 
     def read_state(self) -> "JooanState":
@@ -603,6 +627,8 @@ class _MqttState:
                 return
             if "deviceId" in payload and payload["deviceId"] != self.device_id:
                 return
+            if "status" in payload and not _success(payload["status"]):
+                return
             self.reply_received = True
             self._condition.notify_all()
 
@@ -641,18 +667,31 @@ class _MqttState:
 class JooanState:
     """Cloud-reported night-vision mode and daily schedule (whole hours)."""
 
-    def __init__(self, mode: int | None, start: int | None, end: int | None) -> None:
+    def __init__(
+        self,
+        mode: int | None,
+        start: int | None,
+        end: int | None,
+        timezone: str | None = None,
+        timezone_id: str | None = None,
+    ) -> None:
         self.mode = mode
         self.start = start
         self.end = end
+        self.timezone = timezone
+        self.timezone_id = timezone_id
+
+    def _key(self) -> tuple:
+        return (self.mode, self.start, self.end, self.timezone, self.timezone_id)
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, JooanState) and (
-            self.mode, self.start, self.end
-        ) == (other.mode, other.start, other.end)
+        return isinstance(other, JooanState) and self._key() == other._key()
 
     def __repr__(self) -> str:
-        return f"JooanState(mode={self.mode}, start={self.start}, end={self.end})"
+        return (
+            f"JooanState(mode={self.mode}, start={self.start}, end={self.end}, "
+            f"timezone={self.timezone}, timezone_id={self.timezone_id})"
+        )
 
 
 def _hour_ok(value: object) -> bool:
@@ -719,6 +758,21 @@ def state_from_properties(props: Mapping[str, object]) -> JooanState:
     raw = props.get("floodlight")
     if type(raw) is str and raw.isascii() and raw.isdigit() and len(raw) <= 3:
         raw = int(raw)
-    mode = raw if _actual_int(raw) and raw in (0, 1, 2) else None
+    mode = raw if _actual_int(raw) and raw in MODES else None
     window = parse_schedule(props.get(SCHEDULE_KEY))
-    return JooanState(mode, *(window or (None, None)))
+    return JooanState(
+        mode,
+        *(window or (None, None)),
+        _gmt_string(props.get("timezone")),
+        _zone_id(props.get("timezone_id")),
+    )
+
+
+def _gmt_string(value: object) -> str | None:
+    if type(value) is str and re.fullmatch(r"GMT[+-][0-9]{2}:[0-9]{2}", value):
+        return value
+    return None
+
+
+def _zone_id(value: object) -> str | None:
+    return value if type(value) is str and value in TIME_ZONES else None

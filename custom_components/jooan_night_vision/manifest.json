@@ -6,5 +6,5 @@
   "iot_class": "assumed_state",
   "issue_tracker": "https://github.com/boazwasserman/jooan-camera-controls/issues",
   "requirements": ["defusedxml>=0.7.1", "paho-mqtt>=2.1.0"],
-  "version": "1.1.0"
+  "version": "1.2.0"
 }
