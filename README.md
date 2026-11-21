@@ -64,10 +64,19 @@ color**, and **Smart full color**. Scheduled full color is a device schedule
 mode; it is not a promise of always-on full color.
 
 The integration verifies that the configured device is uniquely owned before
-publishing a command. It waits for the device acknowledgement and then exposes
-the last acknowledged option as assumed state. There is no startup polling,
-startup write, startup network command, or device readback; state is unknown
-after startup or reload. No application ID is bundled with this package.
+publishing a command, waits for the device acknowledgement, then reads the
+cloud-reported mode and schedule back (cloud login only, no MQTT) and compares
+it with the desired state. The select exposes `cloud_option`, `schedule_start`,
+`schedule_end`, `confirmed`, `last_read_at` and `read_error` attributes, polls
+every 15 minutes, and re-reads about three seconds after every change. If the
+read-back does not match, the action fails with "did not confirm" and
+`confirmed` is `false`. There is no startup write or startup device command;
+state before the first read is unknown. No application ID is bundled with this
+package.
+
+The `jooan_night_vision.set_schedule` action (`entity_id`, whole-hour `start`
+and `end`) writes the camera's own daily Scheduled-full-color window and
+confirms it the same way. See [`docs/night-vision-protocol.md`](docs/night-vision-protocol.md).
 
 ## Optional local PTZ
 
@@ -163,8 +172,9 @@ are not assumed to be equivalent to this guarded backend.
 
 - Cloud mode support depends on the JOOAN service, account, application ID,
   owned device identifiers, and vendor protocol behavior.
-- Mode state is assumed from the last acknowledged command; physical readback
-  is not supported.
+- Read-back is the vendor-relayed cloud record, not a direct camera query; an
+  offline camera or cloud lag shows as unconfirmed. A day-only "Off" mode is not
+  exposed because its command value is not known.
 - PTZ support is optional and only suitable for cameras whose ONVIF endpoint,
   profile, credentials, and interlocks have been independently qualified.
 - Do not place credentials, private addresses, device identifiers, raw cloud

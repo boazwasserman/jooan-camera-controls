@@ -13,6 +13,7 @@ from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
 from custom_components.jooan_night_vision import client
+from custom_components.jooan_night_vision import select as select_module
 from custom_components.jooan_night_vision.select import (
     OPTIONS,
     PLATFORM_SCHEMA,
@@ -162,6 +163,11 @@ def _patch_transport(monkeypatch):
     monkeypatch.setattr(client.requests, "Session", FakeSession)
     monkeypatch.setattr(client.mqtt, "Client", FakeMqtt)
     monkeypatch.setattr(client.secrets, "token_hex", lambda _: "0123456789abcdef")
+
+
+@pytest.fixture(autouse=True)
+def _no_confirm_delay(monkeypatch):
+    monkeypatch.setattr(select_module, "CONFIRM_DELAY", 0)
 
 
 @pytest.mark.parametrize("mode", (0, 1, 2))
@@ -402,14 +408,14 @@ class _FakeHass:
         self.worker = worker
         self.writes = 0
 
-    def async_add_executor_job(self, _function, _mode):
+    def async_add_executor_job(self, _function, *_args):
         return asyncio.create_task(self.worker())
 
 
 @pytest.mark.asyncio
 async def test_entity_executor_scheduling_failure_clears_assumed_state():
     class BrokenHass:
-        def async_add_executor_job(self, _function, _mode):
+        def async_add_executor_job(self, _function, *_args):
             raise RuntimeError("executor unavailable")
 
     entity = JooanNightVisionSelect(
@@ -485,7 +491,7 @@ async def test_entity_cancellation_holds_account_lock_until_worker_finishes(work
 
 
 @pytest.mark.asyncio
-async def test_platform_setup_reuses_account_lock_but_separates_accounts():
+async def test_platform_setup_reuses_account_lock_but_separates_accounts(monkeypatch):
     class Hass:
         def __init__(self):
             self.data = {}
@@ -502,7 +508,16 @@ async def test_platform_setup_reuses_account_lock_but_separates_accounts():
             {"key": "back", "name": "Back", "device_id": "back"},
         ],
     }
+    registered = []
+    monkeypatch.setattr(
+        select_module.entity_platform,
+        "async_get_current_platform",
+        lambda: SimpleNamespace(
+            async_register_entity_service=lambda *a: registered.append(a)
+        ),
+    )
     await async_setup_platform(hass, config, entities.extend)
+    assert registered[0][0] == "set_schedule"
     second = dict(config, email="a@example.invalid")
     await async_setup_platform(hass, second, entities.extend)
     other = dict(config, email="other@example.invalid")
@@ -543,7 +558,7 @@ async def test_entity_confirms_after_cleanup_reasserts_and_clears_failed_command
         calls.append(True)
         started.set()
         await released.wait()
-        if len(calls) == 3:
+        if len(calls) == 5:
             raise client.JooanClientError("command failed")
 
     entity = JooanNightVisionSelect(
@@ -563,7 +578,7 @@ async def test_entity_confirms_after_cleanup_reasserts_and_clears_failed_command
     assert entity.current_option == OPTIONS[0]
     assert entity.extra_state_attributes["last_acknowledged_at"] is not None
     await entity.async_select_option(OPTIONS[0])
-    assert len(calls) == 2
+    assert len(calls) == 4
     with pytest.raises(HomeAssistantError):
         await entity.async_select_option(OPTIONS[1])
     assert entity.current_option is None
@@ -674,3 +689,230 @@ def test_cleanup_accepts_already_disconnected_and_stopped_client(monkeypatch):
         application_id="X" * 20, device_id="camera-one-uid",
     ).set_mode(2)
     assert FakeSession.instances[-1].closed
+
+# ---- read-back, schedule and confirmed-state tests -------------------------
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "ranges"),
+    (
+        (20, 6, ["00:00:00-06:00:00", "20:00:00-24:00:00"]),
+        (21, 7, ["00:00:00-07:00:00", "21:00:00-24:00:00"]),
+        (22, 0, ["22:00:00-24:00:00"]),
+        (1, 5, ["01:00:00-05:00:00"]),
+    ),
+)
+def test_schedule_builder_matches_cloud_range_format_and_round_trips(
+    start, end, ranges
+):
+    schedule = client.build_schedule(start, end)
+    assert schedule["week"] == [1, 2, 3, 4, 5, 6, 7]
+    assert all(schedule[f"week{day}"] == ranges for day in range(1, 8))
+    assert client.parse_schedule(schedule) == (start, end)
+
+
+@pytest.mark.parametrize("start,end", ((20, 20), (-1, 5), (5, 24), (True, 5), ("20", 6)))
+def test_schedule_builder_rejects_invalid_hours(start, end):
+    with pytest.raises(client.JooanClientError):
+        client.build_schedule(start, end)
+
+
+def test_schedule_parser_fails_closed_on_irregular_data():
+    base = client.build_schedule(20, 6)
+    uneven = dict(base, week3=["01:00:00-02:00:00"])
+    minutes = dict(base, week1=["00:00:00-06:30:00", "20:00:00-24:00:00"])
+    split = {f"week{d}": ["01:00:00-02:00:00", "05:00:00-06:00:00"] for d in range(1, 8)}
+    full = {f"week{d}": ["00:00:00-24:00:00"] for d in range(1, 8)}
+    for bad in (None, {}, uneven, minutes, split, full, {"week1": "x"}):
+        assert client.parse_schedule(bad) is None
+
+
+def test_state_from_properties_validates_mode():
+    props = {"floodlight": 1, "newflood_light_schedule": client.build_schedule(20, 6)}
+    assert client.state_from_properties(props) == client.JooanState(1, 20, 6)
+    assert client.state_from_properties({"floodlight": "2"}).mode == 2
+    assert client.state_from_properties({"floodlight": "\u0662"}).mode is None
+    for bad in (3, -1, None, True, "x"):
+        assert client.state_from_properties({"floodlight": bad}).mode is None
+
+
+def test_read_state_logs_in_reads_and_logs_out_without_mqtt(monkeypatch):
+    _patch_transport(monkeypatch)
+
+    def factory(session, url, _kwargs):
+        payload = session.responses.pop(0)
+        if url.endswith("query_device_list"):
+            payload["device_info_list"][0]["jooan_info"]["properties"].update(
+                floodlight=1,
+                newflood_light_schedule=client.build_schedule(20, 6),
+            )
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(FakeSession, "response_factory", factory)
+    state = client.JooanClient(
+        email="a@example.invalid", password="secret",
+        application_id="X" * 20, device_id="camera-one-uid",
+    ).read_state()
+    assert state == client.JooanState(1, 20, 6)
+    paths = [r[0].rsplit("/", 1)[-1] for r in FakeSession.instances[-1].requests]
+    assert paths == ["pcLogin", "query_device_list", "pcLogout"]
+    assert FakeMqtt.instance is None
+    assert FakeSession.instances[-1].closed
+
+
+def test_read_state_failure_is_sanitized_and_logs_out(monkeypatch):
+    _patch_transport(monkeypatch)
+
+    def factory(session, url, _kwargs):
+        if url.endswith("query_device_list"):
+            return FakeResponse({"error_code": "9", "secret": "private"})
+        return FakeResponse(session.responses.pop(0) if not url.endswith("pcLogout") else {"error_code": "0"})
+
+    monkeypatch.setattr(FakeSession, "response_factory", factory)
+    with pytest.raises(client.JooanClientError) as error:
+        client.JooanClient(
+            email="a@example.invalid", password="secret",
+            application_id="X" * 20, device_id="camera-one-uid",
+        ).read_state()
+    assert "private" not in str(error.value)
+    assert FakeSession.instances[-1].requests[-1][0].endswith("pcLogout")
+
+
+def test_set_schedule_publishes_cloud_format_and_requires_matching_ack(monkeypatch):
+    _patch_transport(monkeypatch)
+
+    def publish(self, topic, payload, qos, retain):
+        self.published = (topic, json.loads(payload), qos, retain)
+        self.on_publish(self, None, 44, SimpleNamespace(value=0), None)
+        self.on_message(
+            self, None,
+            SimpleNamespace(
+                topic="qaiot/mqtt/user/camera-one-uid", retain=False,
+                payload=json.dumps({"cmd_type": "response", "cmd": 66452, "status": 0}).encode(),
+            ),
+        )
+        return FakeInfo()
+
+    monkeypatch.setattr(FakeMqtt, "publish", publish)
+    client.JooanClient(
+        email="a@example.invalid", password="secret",
+        application_id="X" * 20, device_id="camera-one-uid",
+    ).set_schedule(20, 6)
+    topic, body, qos, retain = FakeMqtt.instance.published
+    assert topic == "qaiot/mqtt/camera-one-uid" and qos == 1 and retain is False
+    assert body == {
+        "cmd_type": "request",
+        "cmd": 66452,
+        "newflood_light_schedule": client.build_schedule(20, 6),
+    }
+
+
+def test_set_schedule_wrong_command_ack_is_not_success(monkeypatch):
+    _patch_transport(monkeypatch)
+    for timeout in ("_REPLY_TIMEOUT",):
+        monkeypatch.setattr(client, timeout, 0)
+    # the default FakeMqtt answers with the mode command 66435, not 66452
+    with pytest.raises(client.JooanClientError):
+        client.JooanClient(
+            email="a@example.invalid", password="secret",
+            application_id="X" * 20, device_id="camera-one-uid",
+        ).set_schedule(20, 6)
+
+
+def _entity(hass):
+    entity = JooanNightVisionSelect(
+        hass, asyncio.Lock(), email="a@example.invalid", password="secret",
+        application_id="X" * 20, key="back", name="Back", device_id="back",
+    )
+    entity.async_write_ha_state = lambda: None
+    return entity
+
+
+class _ReadHass:
+    """Executor fake: set commands succeed, read_state returns the cloud state."""
+
+    def __init__(self, cloud):
+        self.cloud = cloud
+        self.calls = []
+
+    def async_add_executor_job(self, function, *args):
+        self.calls.append((function.__name__, args))
+
+        async def run():
+            if function.__name__ == "read_state":
+                if isinstance(self.cloud, Exception):
+                    raise self.cloud
+                return self.cloud
+            return None
+
+        return asyncio.create_task(run())
+
+
+@pytest.mark.asyncio
+async def test_entity_reports_confirmed_when_cloud_matches_desired():
+    hass = _ReadHass(client.JooanState(1, 20, 6))
+    entity = _entity(hass)
+    await entity.async_select_option(OPTIONS[1])
+    attrs = entity.extra_state_attributes
+    assert entity.current_option == OPTIONS[1]
+    assert attrs["confirmed"] is True and attrs["readback_supported"] is True
+    assert attrs["schedule_start"] == "20:00" and attrs["schedule_end"] == "06:00"
+    assert attrs["state_source"] == "cloud_readback"
+    assert [c[0] for c in hass.calls] == ["set_mode", "read_state"]
+
+
+@pytest.mark.asyncio
+async def test_entity_flags_unconfirmed_and_raises_when_cloud_disagrees():
+    hass = _ReadHass(client.JooanState(0, 20, 6))
+    entity = _entity(hass)
+    with pytest.raises(HomeAssistantError, match="did not confirm"):
+        await entity.async_select_option(OPTIONS[1])
+    assert entity.current_option == OPTIONS[1]  # desired stays visible
+    assert entity.extra_state_attributes["confirmed"] is False
+    assert entity.extra_state_attributes["cloud_option"] == OPTIONS[0]
+
+
+@pytest.mark.asyncio
+async def test_set_schedule_confirms_or_flags_window_mismatch():
+    hass = _ReadHass(client.JooanState(1, 20, 6))
+    entity = _entity(hass)
+    await entity.async_set_schedule("20:00", "06:00")
+    assert entity.extra_state_attributes["confirmed"] is True
+    assert hass.calls[0] == ("set_schedule", (20, 6))
+    hass.cloud = client.JooanState(1, 21, 7)
+    with pytest.raises(HomeAssistantError):
+        await entity.async_set_schedule("20:00", "06:00")
+    assert entity.extra_state_attributes["confirmed"] is False
+    with pytest.raises(HomeAssistantError):
+        await entity.async_set_schedule("05:00", "05:00")
+
+
+@pytest.mark.asyncio
+async def test_read_failure_keeps_last_state_and_reports_error():
+    hass = _ReadHass(client.JooanState(1, 20, 6))
+    entity = _entity(hass)
+    await entity.async_refresh()
+    hass.cloud = client.JooanClientError("down")
+    await entity.async_refresh()
+    attrs = entity.extra_state_attributes
+    assert attrs["read_error"] == "camera state could not be read"
+    assert attrs["cloud_option"] == OPTIONS[1]
+    assert entity.current_option == OPTIONS[1]
+
+
+@pytest.mark.asyncio
+async def test_refresh_is_skipped_while_a_command_holds_the_lock():
+    hass = _ReadHass(client.JooanState(1, 20, 6))
+    entity = _entity(hass)
+    async with entity._lock:
+        await entity.async_refresh()
+    assert hass.calls == []
+
+
+def test_set_schedule_service_schema_accepts_only_whole_hours():
+    schema = select_module._HOUR_TIME
+    assert schema("20:00") == "20:00"
+    assert schema("20:00:00") == "20:00:00"
+    for bad in ("20:30", "24:00", "8:00", "ab", 20, "20:00\n", "20:00:30"):
+        with pytest.raises(vol.Invalid):
+            schema(bad)
