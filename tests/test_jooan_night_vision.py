@@ -18,6 +18,7 @@ from custom_components.jooan_night_vision.select import (
     OPTIONS,
     PLATFORM_SCHEMA,
     JooanNightVisionSelect,
+    JooanTimeZoneSelect,
     async_setup_platform,
 )
 
@@ -170,7 +171,7 @@ def _no_confirm_delay(monkeypatch):
     monkeypatch.setattr(select_module, "CONFIRM_DELAY", 0)
 
 
-@pytest.mark.parametrize("mode", (0, 1, 2))
+@pytest.mark.parametrize("mode", (0, 1, 2, 3))
 def test_mode_command_matches_actual_vendor_shapes_and_ack(monkeypatch, mode):
     _patch_transport(monkeypatch)
 
@@ -522,11 +523,15 @@ async def test_platform_setup_reuses_account_lock_but_separates_accounts(monkeyp
     await async_setup_platform(hass, second, entities.extend)
     other = dict(config, email="other@example.invalid")
     await async_setup_platform(hass, other, entities.extend)
-    assert entities[0]._lock is entities[2]._lock
-    assert entities[0]._lock is not entities[4]._lock
+    nights = [e for e in entities if isinstance(e, JooanNightVisionSelect)]
+    assert len(nights) == 6 and len(entities) == 12
+    assert nights[0]._lock is nights[2]._lock
+    assert nights[0]._lock is not nights[4]._lock
     assert {entity.unique_id for entity in entities} == {
         "front_night_vision",
         "back_night_vision",
+        "front_time_zone",
+        "back_time_zone",
     }
 
 
@@ -732,7 +737,8 @@ def test_state_from_properties_validates_mode():
     assert client.state_from_properties(props) == client.JooanState(1, 20, 6)
     assert client.state_from_properties({"floodlight": "2"}).mode == 2
     assert client.state_from_properties({"floodlight": "\u0662"}).mode is None
-    for bad in (3, -1, None, True, "x"):
+    assert client.state_from_properties({"floodlight": 3}).mode == 3
+    for bad in (4, -1, None, True, "x"):
         assert client.state_from_properties({"floodlight": bad}).mode is None
 
 
@@ -923,3 +929,175 @@ def test_set_schedule_service_schema_accepts_only_whole_hours():
     for bad in ("20:30", "24:00", "8:00", "ab", 20, "20:00\n", "20:00:30"):
         with pytest.raises(vol.Invalid):
             schema(bad)
+
+
+def test_off_option_is_mode_three():
+    assert OPTIONS[3] == "Off" and select_module.MODE_BY_OPTION["Off"] == 3
+    with pytest.raises(client.JooanClientError):
+        client.JooanClient(
+            email="a@example.invalid", password="secret",
+            application_id="X" * 20, device_id="camera-one-uid",
+        ).set_mode(4)
+
+
+def test_cloud_offset_follows_the_zone_rules():
+    from datetime import datetime, timezone
+
+    from custom_components.jooan_night_vision.timezones import TIME_ZONES, cloud_offset
+
+    winter = datetime(2026, 11, 21, tzinfo=timezone.utc)
+    summer = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert cloud_offset("Asia/Jerusalem", winter) == "GMT+02:00"
+    assert cloud_offset("Asia/Jerusalem", summer) == "GMT+03:00"
+    assert cloud_offset("America/St_Johns", winter) == "GMT-03:30"
+    assert cloud_offset("UTC", winter) == "GMT+00:00"
+    assert cloud_offset("Asia/Kathmandu", winter) == "GMT+05:45"
+    assert len(set(TIME_ZONES)) == len(TIME_ZONES)
+    for bad in ("Mars/Base", "", "asia/jerusalem", "../etc/passwd"):
+        with pytest.raises(ValueError):
+            cloud_offset(bad)
+
+
+def test_set_time_zone_publishes_vendor_form_and_requires_matching_ack(monkeypatch):
+    _patch_transport(monkeypatch)
+
+    def publish(self, topic, payload, qos, retain):
+        self.published = (topic, json.loads(payload), qos, retain)
+        self.on_publish(self, None, 44, SimpleNamespace(value=0), None)
+        self.on_message(
+            self, None,
+            SimpleNamespace(
+                topic="qaiot/mqtt/user/camera-one-uid", retain=False,
+                payload=json.dumps({"cmd_type": "response", "cmd": 66357, "status": 0}).encode(),
+            ),
+        )
+        return FakeInfo()
+
+    monkeypatch.setattr(FakeMqtt, "publish", publish)
+    monkeypatch.setattr(
+        client, "cloud_offset", lambda zone: "GMT+02:00"
+    )
+    client.JooanClient(
+        email="a@example.invalid", password="secret",
+        application_id="X" * 20, device_id="camera-one-uid",
+    ).set_time_zone("Asia/Jerusalem")
+    topic, body, qos, retain = FakeMqtt.instance.published
+    assert topic == "qaiot/mqtt/camera-one-uid" and qos == 1 and retain is False
+    assert body == {"cmd_type": "request", "cmd": 66357, "value": "GMT+02:00"}
+
+
+def test_set_time_zone_rejects_unknown_zone_and_failed_or_wrong_ack(monkeypatch):
+    _patch_transport(monkeypatch)
+    monkeypatch.setattr(client, "_REPLY_TIMEOUT", 0)
+    cam = client.JooanClient(
+        email="a@example.invalid", password="secret",
+        application_id="X" * 20, device_id="camera-one-uid",
+    )
+    with pytest.raises(client.JooanClientError, match="not supported"):
+        cam.set_time_zone("Mars/Base")
+    assert FakeMqtt.instance is None
+    # the default FakeMqtt answers with the mode command, not 66357
+    with pytest.raises(client.JooanClientError):
+        cam.set_time_zone("Asia/Jerusalem")
+
+    def failing(self, topic, payload, qos, retain):
+        self.on_publish(self, None, 44, SimpleNamespace(value=0), None)
+        self.on_message(
+            self, None,
+            SimpleNamespace(
+                topic="qaiot/mqtt/user/camera-one-uid", retain=False,
+                payload=json.dumps({"cmd_type": "response", "cmd": 66357, "status": 1}).encode(),
+            ),
+        )
+        return FakeInfo()
+
+    monkeypatch.setattr(FakeMqtt, "publish", failing)
+    with pytest.raises(client.JooanClientError):
+        cam.set_time_zone("Asia/Jerusalem")
+
+
+def test_state_from_properties_reads_timezone_and_validates_it():
+    state = client.state_from_properties(
+        {"timezone": "GMT+02:00", "timezone_id": "Asia/Jerusalem"}
+    )
+    assert (state.timezone, state.timezone_id) == ("GMT+02:00", "Asia/Jerusalem")
+    for bad in ("GMT+2:00", "UTC", None, 3, "GMT+\u0662\u0662:00", "GMT+02:00\n"):
+        assert client.state_from_properties({"timezone": bad}).timezone is None
+    for bad in ("Mars/Base", None, 5, "asia/jerusalem"):
+        assert client.state_from_properties({"timezone_id": bad}).timezone_id is None
+
+
+def _tz_pair(hass):
+    night = _entity(hass)
+    zone = JooanTimeZoneSelect(night, "back", "Back Night Vision")
+    zone.async_write_ha_state = lambda: None
+    night.add_listener(zone.cloud_updated)
+    return night, zone
+
+
+def test_time_zone_entity_names_and_options():
+    _, zone = _tz_pair(_ReadHass(None))
+    assert zone.unique_id == "back_time_zone" and zone.name == "Back Time Zone"
+    assert "Asia/Jerusalem" in zone.options and zone.current_option is None
+
+
+@pytest.mark.asyncio
+async def test_time_zone_entity_shows_cloud_id_when_offset_matches(monkeypatch):
+    monkeypatch.setattr(
+        "custom_components.jooan_night_vision.select.cloud_offset",
+        lambda z: {"Asia/Jerusalem": "GMT+02:00", "Europe/Rome": "GMT+01:00"}[z],
+    )
+    hass = _ReadHass(client.JooanState(1, 20, 6, "GMT+02:00", "Asia/Jerusalem"))
+    night, zone = _tz_pair(hass)
+    await night.async_refresh()
+    assert zone.current_option == "Asia/Jerusalem"
+    assert zone.extra_state_attributes["cloud_timezone"] == "GMT+02:00"
+    # an id that disagrees with the offset is not trusted
+    hass.cloud = client.JooanState(1, 20, 6, "GMT+01:00", "Asia/Jerusalem")
+    await night.async_refresh()
+    assert zone.current_option is None
+
+
+@pytest.mark.asyncio
+async def test_time_zone_select_sends_command_and_confirms_by_readback(monkeypatch):
+    monkeypatch.setattr(
+        "custom_components.jooan_night_vision.select.cloud_offset",
+        lambda z: "GMT+02:00",
+    )
+    hass = _ReadHass(client.JooanState(0, None, None, "GMT+02:00", None))
+    night, zone = _tz_pair(hass)
+    await zone.async_select_option("Asia/Jerusalem")
+    assert hass.calls[0] == ("set_time_zone", ("Asia/Jerusalem",))
+    assert zone.current_option == "Asia/Jerusalem"  # remembered, offset confirmed
+    assert night._last_acknowledged_at is None  # night-vision state untouched
+    hass.cloud = client.JooanState(0, None, None, "GMT+03:00", None)
+    with pytest.raises(HomeAssistantError, match="did not confirm"):
+        await zone.async_select_option("Asia/Jerusalem")
+    assert zone.current_option is None
+    with pytest.raises(HomeAssistantError, match="Invalid"):
+        await zone.async_select_option("Mars/Base")
+
+
+@pytest.mark.asyncio
+async def test_time_zone_failure_does_not_clear_night_vision_state(monkeypatch):
+    monkeypatch.setattr(
+        "custom_components.jooan_night_vision.select.cloud_offset",
+        lambda z: "GMT+02:00",
+    )
+
+    class Failing(_ReadHass):
+        def async_add_executor_job(self, function, *args):
+            async def run():
+                if function.__name__ == "set_time_zone":
+                    raise client.JooanClientError("secret detail")
+                return self.cloud
+
+            return asyncio.create_task(run())
+
+    hass = Failing(client.JooanState(1, 20, 6, "GMT+02:00", None))
+    night, zone = _tz_pair(hass)
+    await night.async_refresh()
+    with pytest.raises(HomeAssistantError) as error:
+        await zone.async_select_option("Asia/Jerusalem")
+    assert "secret" not in str(error.value)
+    assert night.current_option == OPTIONS[1]

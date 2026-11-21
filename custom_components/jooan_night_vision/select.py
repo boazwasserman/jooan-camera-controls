@@ -9,23 +9,30 @@ from datetime import datetime, timedelta, timezone
 import voluptuous as vol
 from homeassistant.components.select import PLATFORM_SCHEMA as SELECT_PLATFORM_SCHEMA
 from homeassistant.components.select import SelectEntity
-from homeassistant.const import CONF_EMAIL, CONF_NAME, CONF_PASSWORD
-from homeassistant.core import HomeAssistant
+from homeassistant.const import CONF_EMAIL, CONF_NAME, CONF_PASSWORD, EntityCategory
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import DOMAIN
 from .client import JooanClient, JooanClientError, JooanState, validate_uid
+from .timezones import TIME_ZONES, cloud_offset
 
 CONF_APPLICATION_ID = "application_id"
 CONF_CAMERAS = "cameras"
 CONF_KEY = "key"
 CONF_DEVICE_ID = "device_id"
-OPTIONS = ("Normal night vision", "Scheduled full color", "Smart full color")
-MODE_BY_OPTION = dict(zip(OPTIONS, range(3), strict=True))
+OPTIONS = (
+    "Normal night vision",
+    "Scheduled full color",
+    "Smart full color",
+    "Off",
+)
+MODE_BY_OPTION = dict(zip(OPTIONS, range(4), strict=True))
 POLL_INTERVAL = timedelta(minutes=15)
 CONFIRM_DELAY = 3
 SERVICE_SET_SCHEDULE = "set_schedule"
@@ -101,21 +108,22 @@ async def async_setup_platform(
         {vol.Required("start"): _HOUR_TIME, vol.Required("end"): _HOUR_TIME},
         "async_set_schedule",
     )
-    async_add_entities(
-        [
-            JooanNightVisionSelect(
-                hass,
-                lock,
-                email=config[CONF_EMAIL],
-                password=config[CONF_PASSWORD],
-                application_id=config[CONF_APPLICATION_ID],
-                key=camera[CONF_KEY],
-                name=camera[CONF_NAME],
-                device_id=camera[CONF_DEVICE_ID],
-            )
-            for camera in config[CONF_CAMERAS]
-        ]
-    )
+    entities = []
+    for camera in config[CONF_CAMERAS]:
+        night = JooanNightVisionSelect(
+            hass,
+            lock,
+            email=config[CONF_EMAIL],
+            password=config[CONF_PASSWORD],
+            application_id=config[CONF_APPLICATION_ID],
+            key=camera[CONF_KEY],
+            name=camera[CONF_NAME],
+            device_id=camera[CONF_DEVICE_ID],
+        )
+        zone = JooanTimeZoneSelect(night, camera[CONF_KEY], camera[CONF_NAME])
+        night.add_listener(zone.cloud_updated)
+        entities.extend([night, zone])
+    async_add_entities(entities)
 
 
 class JooanNightVisionSelect(SelectEntity):
@@ -155,6 +163,14 @@ class JooanNightVisionSelect(SelectEntity):
         self._cloud: JooanState | None = None
         self._read_at: str | None = None
         self._read_error: str | None = None
+        self._listeners: list = []
+
+    def add_listener(self, callback) -> None:
+        self._listeners.append(callback)
+
+    @property
+    def cloud_state(self) -> JooanState | None:
+        return self._cloud
 
     @property
     def _cloud_option(self) -> str | None:
@@ -243,8 +259,10 @@ class JooanNightVisionSelect(SelectEntity):
             self._cloud = result
             self._read_error = None
             self._read_at = datetime.now(timezone.utc).isoformat()
+            for callback in self._listeners:
+                callback()
 
-    async def _run_command(self, func, *args) -> None:
+    async def _run_command(self, func, *args, night: bool = True) -> None:
         """Run one blocking command under the lock, then read back to confirm."""
         if self._lock.locked():
             raise HomeAssistantError(
@@ -279,10 +297,11 @@ class JooanNightVisionSelect(SelectEntity):
                     raise HomeAssistantError(
                         "JOOAN night-vision command failed"
                     ) from None
-                self._last_acknowledged_at = datetime.now(timezone.utc).isoformat()
+                if night:
+                    self._last_acknowledged_at = datetime.now(timezone.utc).isoformat()
                 succeeded = True
             finally:
-                if not succeeded:
+                if not succeeded and night:
                     self._clear_state()
             await asyncio.sleep(CONFIRM_DELAY)
             await self._async_read()
@@ -305,9 +324,92 @@ class JooanNightVisionSelect(SelectEntity):
         self._publish()
         self._raise_if_unconfirmed()
 
+    async def async_set_time_zone(self, zone: str) -> None:
+        """Set the camera time zone under the shared lock, then read back."""
+        await self._run_command(self._client.set_time_zone, zone, night=False)
+        cloud = self._cloud
+        if cloud is None or cloud.timezone != cloud_offset(zone):
+            raise HomeAssistantError(
+                "The camera accepted the command but its reported time zone "
+                "did not confirm it yet"
+            )
+
     def _raise_if_unconfirmed(self) -> None:
         if self._confirmed is False:
             raise HomeAssistantError(
                 "The camera accepted the command but its reported state "
                 "did not confirm it yet"
             )
+
+
+class JooanTimeZoneSelect(RestoreEntity, SelectEntity):
+    """Per-camera time zone (IANA names, sent as the cloud ``GMT+hh:mm``).
+
+    The camera reports only the GMT offset, so the IANA name Home Assistant
+    last set is remembered and shown while the cloud offset still matches it.
+    """
+
+    _attr_options = list(TIME_ZONES)
+    _attr_should_poll = False
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, night: JooanNightVisionSelect, key: str, name: str) -> None:
+        self._night = night
+        base = name.removesuffix(" Night Vision")
+        self._attr_name = f"{base} Time Zone"
+        self._attr_unique_id = f"{key}_time_zone"
+        self._attr_current_option = None
+        self._remembered: str | None = None
+
+    @property
+    def _cloud_gmt(self) -> str | None:
+        cloud = self._night.cloud_state
+        return None if cloud is None else cloud.timezone
+
+    def _matches(self, zone: str | None) -> bool:
+        if zone is None or self._cloud_gmt is None:
+            return False
+        try:
+            return cloud_offset(zone) == self._cloud_gmt
+        except ValueError:
+            return False
+
+    def _resolve(self) -> str | None:
+        cloud = self._night.cloud_state
+        if cloud is not None and cloud.timezone_id is not None:
+            if self._matches(cloud.timezone_id):
+                return cloud.timezone_id
+        if self._matches(self._remembered):
+            return self._remembered
+        return None
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            "cloud_timezone": self._cloud_gmt,
+            "cloud_timezone_id": (
+                None
+                if self._night.cloud_state is None
+                else self._night.cloud_state.timezone_id
+            ),
+        }
+
+    async def async_added_to_hass(self) -> None:
+        last = await self.async_get_last_state()
+        if last is not None and last.state in TIME_ZONES:
+            self._remembered = last.state
+        self._attr_current_option = self._resolve()
+
+    @callback
+    def cloud_updated(self) -> None:
+        self._attr_current_option = self._resolve()
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in TIME_ZONES:
+            raise HomeAssistantError("Invalid JOOAN time zone")
+        await self._night.async_set_time_zone(option)
+        self._remembered = option
+        self._attr_current_option = self._resolve()
+        self.async_write_ha_state()
