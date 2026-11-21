@@ -17,6 +17,8 @@ import requests
 BASE_URL = "https://use1api.jooaniot.com"
 PACKAGE_NAME = "CAM720.vmsToolsApp"
 COMMAND = 66435
+SCHEDULE_COMMAND = 66452
+SCHEDULE_KEY = "newflood_light_schedule"
 _HOST_SUFFIXES = (".jooaniot.com", ".qalink.cn")
 _EXACT_HOST = "huiyancommserver.lenovo.com.cn"
 _MAX_JSON = 1024 * 1024
@@ -132,6 +134,63 @@ class JooanClient:
     def set_mode(self, mode: int) -> None:
         if not _actual_int(mode) or mode not in (0, 1, 2):
             raise JooanClientError("The night-vision mode is invalid")
+        self._run(
+            {"cmd_type": "request", "cmd": COMMAND, "value": mode},
+            COMMAND,
+            mode,
+            "The JOOAN night-vision command failed",
+        )
+
+    def set_schedule(self, start_hour: int, end_hour: int) -> None:
+        """Write the daily full-colour night schedule (whole hours)."""
+        schedule = build_schedule(start_hour, end_hour)
+        self._run(
+            {
+                "cmd_type": "request",
+                "cmd": SCHEDULE_COMMAND,
+                SCHEDULE_KEY: schedule,
+            },
+            SCHEDULE_COMMAND,
+            None,
+            "The JOOAN schedule command failed",
+        )
+
+    def read_state(self) -> "JooanState":
+        """Read the cloud-reported mode and schedule (no device command)."""
+        session = requests.Session()
+        session.trust_env = False
+        session_values: dict[str, str] | None = None
+        failure: Exception | None = None
+        result = JooanState(None, None, None)
+        try:
+            session_values = self._login(session)
+            props = self._owned_properties(session, session_values)
+            result = state_from_properties(props)
+        except _ResponseCleanupError as err:
+            if err.session_values is not None:
+                session_values = err.session_values
+            failure = err
+        except JooanClientError as err:
+            failure = err
+        except (OSError, TypeError, ValueError, AttributeError, RuntimeError,
+                requests.RequestException):
+            failure = JooanClientError("The JOOAN state read failed")
+        finally:
+            if session_values is not None:
+                try:
+                    self._logout(session, session_values)
+                except (OSError, TypeError, ValueError, AttributeError,
+                        RuntimeError, requests.RequestException, JooanClientError):
+                    failure = failure or JooanClientError("JOOAN session cleanup failed")
+            try:
+                session.close()
+            except (OSError, RuntimeError, AttributeError):
+                failure = failure or JooanClientError("JOOAN session cleanup failed")
+        if failure is not None:
+            raise failure
+        return result
+
+    def _run(self, payload, cmd, value, generic_error) -> None:
         session = requests.Session()
         session.trust_env = False
         session_values: dict[str, str] | None = None
@@ -140,7 +199,7 @@ class JooanClient:
             session_values = self._login(session)
             self._verify_owned_device(session, session_values)
             broker = self._discover_broker(session, session_values)
-            self._mqtt_command(broker, session_values, mode)
+            self._mqtt_command(broker, session_values, payload, cmd, value)
         except _ResponseCleanupError as err:
             if err.session_values is not None:
                 session_values = err.session_values
@@ -155,7 +214,7 @@ class JooanClient:
             RuntimeError,
             requests.RequestException,
         ):
-            failure = JooanClientError("The JOOAN night-vision command failed")
+            failure = JooanClientError(generic_error)
         finally:
             cleanup_failure: Exception | None = None
             if session_values is not None:
@@ -300,6 +359,11 @@ class JooanClient:
     def _verify_owned_device(
         self, session: requests.Session, values: Mapping[str, str]
     ) -> None:
+        self._owned_properties(session, values)
+
+    def _owned_properties(
+        self, session: requests.Session, values: Mapping[str, str]
+    ) -> Mapping[str, object]:
         payload = self._request(
             session,
             "/api/vms/device/v3/query_device_list",
@@ -327,6 +391,8 @@ class JooanClient:
                 owned.append(item)
         if len(owned) != 1:
             raise JooanClientError("Configured JOOAN camera was not uniquely owned")
+        info = owned[0]["jooan_info"]
+        return info["properties"]
 
     def _discover_broker(
         self, session: requests.Session, values: Mapping[str, str]
@@ -362,7 +428,12 @@ class JooanClient:
             raise JooanClientError("JOOAN logout failed")
 
     def _mqtt_command(
-        self, broker: tuple[str, int], values: Mapping[str, str], mode: int
+        self,
+        broker: tuple[str, int],
+        values: Mapping[str, str],
+        payload: Mapping[str, object],
+        cmd: int,
+        value: int | None,
     ) -> None:
         host, port = broker
         mqtt_client = None
@@ -377,7 +448,7 @@ class JooanClient:
             )
             mqtt_client.username_pw_set("pc" + values["user_id"], values["token"])
             mqtt_client.tls_set_context(ssl.create_default_context())
-            state = _MqttState(self.device_id, mode)
+            state = _MqttState(self.device_id, value, cmd)
             mqtt_client.on_connect = state.on_connect
             mqtt_client.on_subscribe = state.on_subscribe
             mqtt_client.on_publish = state.on_publish
@@ -401,7 +472,7 @@ class JooanClient:
             state.request_phase = True
             info = mqtt_client.publish(
                 f"qaiot/mqtt/{self.device_id}",
-                json.dumps({"cmd_type": "request", "cmd": COMMAND, "value": mode}),
+                json.dumps(dict(payload)),
                 qos=1,
                 retain=False,
             )
@@ -413,7 +484,7 @@ class JooanClient:
             if not state.wait_for_puback(_PUBACK_TIMEOUT):
                 raise JooanClientError("JOOAN MQTT publish was not acknowledged")
             if not state.wait_for_reply(_REPLY_TIMEOUT):
-                raise JooanClientError("JOOAN device did not acknowledge the mode")
+                raise JooanClientError("JOOAN device did not acknowledge the command")
         except JooanClientError as err:
             failure = err
         except (
@@ -465,9 +536,10 @@ class JooanClient:
 
 
 class _MqttState:
-    def __init__(self, device_id: str, mode: int) -> None:
+    def __init__(self, device_id: str, mode: int | None, cmd: int = COMMAND) -> None:
         self.device_id = device_id
         self.mode = mode
+        self.cmd = cmd
         self.connected = threading.Event()
         self.connection_reason: int | None = None
         self.subscription_mid: int | None = None
@@ -519,9 +591,14 @@ class _MqttState:
             if (
                 payload.get("cmd_type") != "response"
                 or not _actual_int(payload.get("cmd"))
-                or payload["cmd"] != COMMAND
-                or not _actual_int(payload.get("value"))
-                or payload["value"] != self.mode
+                or payload["cmd"] != self.cmd
+                or (
+                    self.mode is not None
+                    and (
+                        not _actual_int(payload.get("value"))
+                        or payload["value"] != self.mode
+                    )
+                )
             ):
                 return
             if "deviceId" in payload and payload["deviceId"] != self.device_id:
@@ -559,3 +636,89 @@ class _MqttState:
                     return False
                 self._condition.wait(remaining)
             return True
+
+
+class JooanState:
+    """Cloud-reported night-vision mode and daily schedule (whole hours)."""
+
+    def __init__(self, mode: int | None, start: int | None, end: int | None) -> None:
+        self.mode = mode
+        self.start = start
+        self.end = end
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, JooanState) and (
+            self.mode, self.start, self.end
+        ) == (other.mode, other.start, other.end)
+
+    def __repr__(self) -> str:
+        return f"JooanState(mode={self.mode}, start={self.start}, end={self.end})"
+
+
+def _hour_ok(value: object) -> bool:
+    return _actual_int(value) and 0 <= value <= 23
+
+
+def build_schedule(start_hour: int, end_hour: int) -> dict[str, object]:
+    """Return the same daily range format the JOOAN cloud stores."""
+    if not _hour_ok(start_hour) or not _hour_ok(end_hour) or start_hour == end_hour:
+        raise JooanClientError("The night-vision schedule hours are invalid")
+    if start_hour < end_hour:
+        ranges = [f"{start_hour:02d}:00:00-{end_hour:02d}:00:00"]
+    else:
+        ranges = [f"{start_hour:02d}:00:00-24:00:00"]
+        if end_hour > 0:
+            ranges.insert(0, f"00:00:00-{end_hour:02d}:00:00")
+    schedule: dict[str, object] = {"week": [1, 2, 3, 4, 5, 6, 7]}
+    for day in range(1, 8):
+        schedule[f"week{day}"] = list(ranges)
+    return schedule
+
+
+def _hours_covered(ranges: object) -> frozenset[int] | None:
+    if not isinstance(ranges, list):
+        return None
+    hours: set[int] = set()
+    for item in ranges:
+        if not isinstance(item, str):
+            return None
+        try:
+            first, last = item.split("-")
+            begin = int(first.split(":")[0])
+            finish = int(last.split(":")[0])
+            if first[2:] != ":00:00" or last[2:] != ":00:00":
+                return None
+        except (ValueError, IndexError):
+            return None
+        if not (0 <= begin < finish <= 24):
+            return None
+        hours.update(range(begin, finish))
+    return frozenset(hours)
+
+
+def parse_schedule(schedule: object) -> tuple[int, int] | None:
+    """Return (start, end) when all days share one contiguous daily window."""
+    if not isinstance(schedule, Mapping):
+        return None
+    found: frozenset[int] | None = None
+    for day in range(1, 8):
+        hours = _hours_covered(schedule.get(f"week{day}"))
+        if hours is None or (found is not None and hours != found):
+            return None
+        found = hours
+    if not found or len(found) == 24:
+        return None
+    starts = [h for h in found if (h - 1) % 24 not in found]
+    ends = [h for h in range(24) if h not in found and (h - 1) % 24 in found]
+    if len(starts) != 1 or len(ends) != 1:
+        return None
+    return starts[0], ends[0]
+
+
+def state_from_properties(props: Mapping[str, object]) -> JooanState:
+    raw = props.get("floodlight")
+    if type(raw) is str and raw.isdigit():
+        raw = int(raw)
+    mode = raw if _actual_int(raw) and raw in (0, 1, 2) else None
+    window = parse_schedule(props.get(SCHEDULE_KEY))
+    return JooanState(mode, *(window or (None, None)))

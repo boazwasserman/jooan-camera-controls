@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import voluptuous as vol
 from homeassistant.components.select import PLATFORM_SCHEMA as SELECT_PLATFORM_SCHEMA
@@ -13,10 +13,12 @@ from homeassistant.const import CONF_EMAIL, CONF_NAME, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 
 from . import DOMAIN
-from .client import JooanClient, JooanClientError, validate_uid
+from .client import JooanClient, JooanClientError, JooanState, validate_uid
 
 CONF_APPLICATION_ID = "application_id"
 CONF_CAMERAS = "cameras"
@@ -24,6 +26,10 @@ CONF_KEY = "key"
 CONF_DEVICE_ID = "device_id"
 OPTIONS = ("Normal night vision", "Scheduled full color", "Smart full color")
 MODE_BY_OPTION = dict(zip(OPTIONS, range(3), strict=True))
+POLL_INTERVAL = timedelta(minutes=15)
+CONFIRM_DELAY = 3
+SERVICE_SET_SCHEDULE = "set_schedule"
+_HOUR_TIME = vol.All(cv.string, vol.Match(r"^([01]\d|2[0-3]):00$"))
 
 _CAMERA_SCHEMA = vol.Schema(
     {
@@ -89,6 +95,12 @@ async def async_setup_platform(
     discovery_info=None,
 ) -> None:
     lock = _account_lock(hass, config[CONF_EMAIL])
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        SERVICE_SET_SCHEDULE,
+        {vol.Required("start"): _HOUR_TIME, vol.Required("end"): _HOUR_TIME},
+        "async_set_schedule",
+    )
     async_add_entities(
         [
             JooanNightVisionSelect(
@@ -107,7 +119,8 @@ async def async_setup_platform(
 
 
 class JooanNightVisionSelect(SelectEntity):
-    """A command select whose state is last acknowledged, not read back."""
+    """Night-vision select. HA keeps the desired state and the cloud read-back
+    confirms it; ``confirmed`` is False when the camera/cloud does not match."""
 
     _attr_assumed_state = True
     _attr_options = list(OPTIONS)
@@ -137,27 +150,99 @@ class JooanNightVisionSelect(SelectEntity):
             device_id=device_id,
         )
         self._last_acknowledged_at: str | None = None
+        self._desired_option: str | None = None
+        self._desired_window: tuple[int, int] | None = None
+        self._cloud: JooanState | None = None
+        self._read_at: str | None = None
+        self._read_error: str | None = None
+
+    @property
+    def _cloud_option(self) -> str | None:
+        if self._cloud is None or self._cloud.mode is None:
+            return None
+        return OPTIONS[self._cloud.mode]
+
+    @property
+    def _cloud_window(self) -> tuple[int, int] | None:
+        if self._cloud is None or self._cloud.start is None:
+            return None
+        return (self._cloud.start, self._cloud.end)
+
+    @property
+    def _confirmed(self) -> bool | None:
+        """True when the cloud read-back matches the desired state."""
+        if self._cloud is None:
+            return None
+        if self._desired_option is not None and self._desired_option != self._cloud_option:
+            return False
+        if self._desired_window is not None and self._desired_window != self._cloud_window:
+            return False
+        if self._desired_option is None and self._desired_window is None:
+            return True if self._cloud_option is not None else None
+        return True
 
     @property
     def extra_state_attributes(self):
+        window = self._cloud_window
         return {
             "state_source": (
-                "last_device_acknowledged_command"
+                "cloud_readback"
+                if self._cloud is not None
+                else "last_device_acknowledged_command"
                 if self._last_acknowledged_at
                 else "unknown"
             ),
             "last_acknowledged_at": self._last_acknowledged_at,
-            "readback_supported": False,
+            "readback_supported": self._cloud is not None,
+            "confirmed": self._confirmed,
+            "cloud_option": self._cloud_option,
+            "schedule_start": f"{window[0]:02d}:00" if window else None,
+            "schedule_end": f"{window[1]:02d}:00" if window else None,
+            "last_read_at": self._read_at,
+            "read_error": self._read_error,
         }
+
+    def _publish(self) -> None:
+        self._attr_current_option = self._desired_option or self._cloud_option
+        self.async_write_ha_state()
 
     def _clear_state(self) -> None:
         self._attr_current_option = None
         self._last_acknowledged_at = None
+        self._desired_option = None
+        self._desired_window = None
         self.async_write_ha_state()
 
-    async def async_select_option(self, option: str) -> None:
-        if option not in MODE_BY_OPTION:
-            raise HomeAssistantError("Invalid JOOAN night-vision option")
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_poll, POLL_INTERVAL)
+        )
+        self.hass.async_create_task(self.async_refresh())
+
+    async def _async_poll(self, _now) -> None:
+        await self.async_refresh()
+
+    async def async_refresh(self) -> None:
+        """Read the cloud state; skipped while a command holds the account lock."""
+        if self._lock.locked():
+            return
+        async with self._lock:
+            await self._async_read()
+        self._publish()
+
+    async def _async_read(self) -> None:
+        try:
+            result = await self.hass.async_add_executor_job(self._client.read_state)
+        except JooanClientError:
+            self._read_error = "camera state could not be read"
+            return
+        if isinstance(result, JooanState):
+            self._cloud = result
+            self._read_error = None
+            self._read_at = datetime.now(timezone.utc).isoformat()
+
+    async def _run_command(self, func, *args) -> None:
+        """Run one blocking command under the lock, then read back to confirm."""
         if self._lock.locked():
             raise HomeAssistantError(
                 "Another JOOAN night-vision command is already in progress"
@@ -168,9 +253,7 @@ class JooanNightVisionSelect(SelectEntity):
             try:
                 try:
                     worker = asyncio.ensure_future(
-                        self.hass.async_add_executor_job(
-                            self._client.set_mode, MODE_BY_OPTION[option]
-                        )
+                        self.hass.async_add_executor_job(func, *args)
                     )
                 except RuntimeError:
                     raise HomeAssistantError(
@@ -193,10 +276,35 @@ class JooanNightVisionSelect(SelectEntity):
                     raise HomeAssistantError(
                         "JOOAN night-vision command failed"
                     ) from None
-                self._attr_current_option = option
                 self._last_acknowledged_at = datetime.now(timezone.utc).isoformat()
-                self.async_write_ha_state()
                 succeeded = True
             finally:
                 if not succeeded:
                     self._clear_state()
+            await asyncio.sleep(CONFIRM_DELAY)
+            await self._async_read()
+            self._publish()
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in MODE_BY_OPTION:
+            raise HomeAssistantError("Invalid JOOAN night-vision option")
+        await self._run_command(self._client.set_mode, MODE_BY_OPTION[option])
+        self._desired_option = option
+        self._publish()
+        self._raise_if_unconfirmed()
+
+    async def async_set_schedule(self, start: str, end: str) -> None:
+        start_hour, end_hour = int(start[:2]), int(end[:2])
+        if start_hour == end_hour:
+            raise HomeAssistantError("Night-vision start and end must differ")
+        await self._run_command(self._client.set_schedule, start_hour, end_hour)
+        self._desired_window = (start_hour, end_hour)
+        self._publish()
+        self._raise_if_unconfirmed()
+
+    def _raise_if_unconfirmed(self) -> None:
+        if self._confirmed is False:
+            raise HomeAssistantError(
+                "The camera accepted the command but its reported state "
+                "did not confirm it yet"
+            )

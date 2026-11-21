@@ -31,3 +31,26 @@ stop:
       selector:
         entity:
           domain: camera
+
+set_schedule:
+  name: Set night-vision schedule
+  description: Write the daily Scheduled full color window (whole hours) and confirm it by reading the camera state back.
+  target:
+    entity:
+      integration: jooan_night_vision
+      domain: select
+  fields:
+    start:
+      name: Start
+      description: Whole-hour start time, for example 20:00.
+      required: true
+      example: "20:00"
+      selector:
+        time:
+    end:
+      name: End
+      description: Whole-hour end time, for example 06:00. May be earlier than start (crosses midnight).
+      required: true
+      example: "06:00"
+      selector:
+        time:
