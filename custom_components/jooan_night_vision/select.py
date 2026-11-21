@@ -29,7 +29,7 @@ MODE_BY_OPTION = dict(zip(OPTIONS, range(3), strict=True))
 POLL_INTERVAL = timedelta(minutes=15)
 CONFIRM_DELAY = 3
 SERVICE_SET_SCHEDULE = "set_schedule"
-_HOUR_TIME = vol.All(cv.string, vol.Match(r"^([01]\d|2[0-3]):00$"))
+_HOUR_TIME = vol.All(cv.string, vol.Match(r"^([01]\d|2[0-3]):00(:00)?\Z"))
 
 _CAMERA_SCHEMA = vol.Schema(
     {

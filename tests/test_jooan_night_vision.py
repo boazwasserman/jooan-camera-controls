@@ -731,6 +731,7 @@ def test_state_from_properties_validates_mode():
     props = {"floodlight": 1, "newflood_light_schedule": client.build_schedule(20, 6)}
     assert client.state_from_properties(props) == client.JooanState(1, 20, 6)
     assert client.state_from_properties({"floodlight": "2"}).mode == 2
+    assert client.state_from_properties({"floodlight": "\u0662"}).mode is None
     for bad in (3, -1, None, True, "x"):
         assert client.state_from_properties({"floodlight": bad}).mode is None
 
@@ -911,6 +912,7 @@ async def test_refresh_is_skipped_while_a_command_holds_the_lock():
 def test_set_schedule_service_schema_accepts_only_whole_hours():
     schema = select_module._HOUR_TIME
     assert schema("20:00") == "20:00"
-    for bad in ("20:30", "24:00", "8:00", "ab", 20):
+    assert schema("20:00:00") == "20:00:00"
+    for bad in ("20:30", "24:00", "8:00", "ab", 20, "20:00\n", "20:00:30"):
         with pytest.raises(vol.Invalid):
             schema(bad)

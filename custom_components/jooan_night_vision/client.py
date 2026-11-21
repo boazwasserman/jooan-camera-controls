@@ -717,7 +717,7 @@ def parse_schedule(schedule: object) -> tuple[int, int] | None:
 
 def state_from_properties(props: Mapping[str, object]) -> JooanState:
     raw = props.get("floodlight")
-    if type(raw) is str and raw.isdigit():
+    if type(raw) is str and raw.isascii() and raw.isdigit() and len(raw) <= 3:
         raw = int(raw)
     mode = raw if _actual_int(raw) and raw in (0, 1, 2) else None
     window = parse_schedule(props.get(SCHEDULE_KEY))
